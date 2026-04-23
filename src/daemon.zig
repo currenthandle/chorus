@@ -26,6 +26,7 @@ const audio = @import("audio.zig");
 const provider = @import("provider.zig");
 const OpenAI = @import("providers/openai.zig").OpenAI;
 const Azure = @import("providers/azure.zig").Azure;
+const ElevenLabs = @import("providers/elevenlabs.zig").ElevenLabs;
 const qmod = @import("queue.zig");
 const registry_mod = @import("registry.zig");
 const chunker = @import("chunker.zig");
@@ -54,7 +55,7 @@ pub const Daemon = struct {
         failed: std.atomic.Value(u64) = .init(0),
     };
 
-    pub const ProviderKind = enum { openai, azure };
+    pub const ProviderKind = enum { openai, azure, elevenlabs };
 
     pub fn run(allocator: std.mem.Allocator, io: std.Io) !void {
         const kind = detectProvider();
@@ -346,6 +347,11 @@ pub const Daemon = struct {
                 defer az.deinit();
                 try self.synthAndPlay(az.provider_handle(), job, volume);
             },
+            .elevenlabs => {
+                var el = try ElevenLabs.initFromEnv(self.allocator);
+                defer el.deinit();
+                try self.synthAndPlay(el.provider_handle(), job, volume);
+            },
         }
     }
 
@@ -395,6 +401,7 @@ fn detectProvider() Daemon.ProviderKind {
     const raw = std.c.getenv("CHORUS_PROVIDER") orelse return .openai;
     const name = std.mem.span(raw);
     if (std.mem.eql(u8, name, "azure")) return .azure;
+    if (std.mem.eql(u8, name, "elevenlabs") or std.mem.eql(u8, name, "11labs")) return .elevenlabs;
     return .openai;
 }
 

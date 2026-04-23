@@ -30,7 +30,7 @@ The problem it solves: running multiple LLM agent sessions that all independentl
 ## Milestones
 
 1. miniaudio binding, play file from disk. ✅
-2. TTS provider interface + OpenAI + Azure implementations. ✅
+2. TTS provider interface + OpenAI + Azure + ElevenLabs implementations. ✅
 3. Daemon skeleton: Unix socket + agent registry + `speak` forwarding. ✅
 4. MCP shim binary: stdio JSON-RPC, forwards to daemon, uses `$TMUX_PANE` as agent identity. ✅
 5. Serialize mixer: global FIFO across agents, one speaks at a time. ✅
@@ -55,6 +55,7 @@ src/
   providers/
     openai.zig     — OpenAI /v1/audio/speech
     azure.zig      — Azure OpenAI TTS deployment
+    elevenlabs.zig — ElevenLabs /v1/text-to-speech/{voice_id}
 vendor/
   miniaudio/       — single-header C audio library
 build.zig          — wires C include/source + platform frameworks

@@ -22,11 +22,20 @@ Requires Zig 0.16.0.
 
 ```bash
 # 1. pick a provider
-export CHORUS_PROVIDER=azure   # or openai
+export CHORUS_PROVIDER=elevenlabs   # or azure, or openai
+
+# elevenlabs (recommended for distinguishing agents — many distinct voices)
+export ELEVENLABS_API_KEY=...
+# optional: export ELEVENLABS_MODEL=eleven_turbo_v2_5
+
+# or azure
 export AZURE_OPENAI_ENDPOINT=https://...
 export AZURE_OPENAI_DEPLOYMENT=gpt-4o-mini-tts
 export AZURE_OPENAI_API_VERSION=2025-03-01-preview
 export AZURE_OPENAI_API_KEY=...
+
+# or openai
+export OPENAI_API_KEY=sk-...
 
 # 2. start the broker (it owns the sound card)
 chorus daemon
@@ -64,6 +73,7 @@ src/
   providers/
     openai.zig     — OpenAI /v1/audio/speech
     azure.zig      — Azure OpenAI TTS deployment
+    elevenlabs.zig — ElevenLabs /v1/text-to-speech/{voice_id}
 vendor/
   miniaudio/       — single-header C audio library
 build.zig          — wires C include/source + platform frameworks
@@ -72,7 +82,7 @@ build.zig          — wires C include/source + platform frameworks
 ## Roadmap
 
 1. miniaudio binding, play file from disk. ✅
-2. TTS provider interface + OpenAI + Azure. ✅
+2. TTS provider interface + OpenAI + Azure + ElevenLabs. ✅
 3. Daemon skeleton + Unix socket + agent registry. ✅
 4. MCP stdio shim. ✅
 5. Serialize mixer: FIFO across agents. ✅

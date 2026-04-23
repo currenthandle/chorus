@@ -3,6 +3,7 @@ const audio = @import("audio.zig");
 const provider = @import("provider.zig");
 const OpenAI = @import("providers/openai.zig").OpenAI;
 const Azure = @import("providers/azure.zig").Azure;
+const ElevenLabs = @import("providers/elevenlabs.zig").ElevenLabs;
 const daemon = @import("daemon.zig");
 const client_mod = @import("client.zig");
 const mcp_shim = @import("mcp_shim.zig");
@@ -106,6 +107,11 @@ fn directSpeak(
             defer az.deinit();
             try runSynth(allocator, io, az.provider_handle(), text, voice);
         },
+        .elevenlabs => {
+            var el = try ElevenLabs.initFromEnv(allocator);
+            defer el.deinit();
+            try runSynth(allocator, io, el.provider_handle(), text, voice);
+        },
     }
 }
 
@@ -204,11 +210,12 @@ fn sendVolumeOp(allocator: std.mem.Allocator, io: std.Io, args: []const [:0]cons
     try sendSimple(allocator, io, buf.written());
 }
 
-const ProviderKind = enum { openai, azure };
+const ProviderKind = enum { openai, azure, elevenlabs };
 
 fn detectProvider() ProviderKind {
     const raw = std.c.getenv("CHORUS_PROVIDER") orelse return .openai;
     const name = std.mem.span(raw);
     if (std.mem.eql(u8, name, "azure")) return .azure;
+    if (std.mem.eql(u8, name, "elevenlabs") or std.mem.eql(u8, name, "11labs")) return .elevenlabs;
     return .openai;
 }
