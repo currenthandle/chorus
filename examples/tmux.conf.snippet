@@ -20,11 +20,11 @@ set -g status-right '#(chorus tmux-status) | %H:%M'
 set -g pane-border-status top
 set -g pane-border-format " #{pane_index} #(chorus tmux-pane #{pane_id}) "
 
-# prefix + n: promote the oldest waiting agent (the whole queue's head).
-bind-key n run-shell "chorus next"
+# prefix + g: "give the mic" — play the oldest waiting agent's next job.
+bind-key g run-shell "chorus next"
 
-# prefix + N (shift-n): promote this pane's next job specifically.
-bind-key N run-shell "chorus next #{pane_id}"
+# prefix + G: play this pane's next job specifically.
+bind-key G run-shell "chorus next #{pane_id}"
 
 # prefix + H: toggle global auto-speak off (hand-raise mode for everyone).
 bind-key H run-shell "chorus auto off"
