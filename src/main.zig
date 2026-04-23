@@ -5,6 +5,7 @@ const OpenAI = @import("providers/openai.zig").OpenAI;
 const Azure = @import("providers/azure.zig").Azure;
 const daemon = @import("daemon.zig");
 const client_mod = @import("client.zig");
+const mcp_shim = @import("mcp_shim.zig");
 
 const usage =
     \\usage:
@@ -13,6 +14,7 @@ const usage =
     \\  chorus daemon                       Run the broker daemon.
     \\  chorus say <text> [voice]           Send a speak job to the running daemon.
     \\  chorus status                       Query daemon stats.
+    \\  chorus mcp                          Run as an MCP stdio server for Claude Code.
     \\
     \\Provider selected by CHORUS_PROVIDER (openai|azure), default openai.
     \\Daemon socket path overridable via CHORUS_SOCKET.
@@ -52,6 +54,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (std.mem.eql(u8, cmd, "status")) {
         try clientStatus(arena, init.io);
+        return;
+    }
+    if (std.mem.eql(u8, cmd, "mcp")) {
+        try mcp_shim.run(init.gpa, init.io);
         return;
     }
 
