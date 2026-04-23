@@ -95,29 +95,44 @@ fn writeInitialize(writer: *std.Io.Writer, id: ?std.json.Value) !void {
 }
 
 fn writeToolsList(writer: *std.Io.Writer, id: ?std.json.Value) !void {
+    const EmptyObject = struct {};
     const speak_schema = .{
         .type = "object",
         .properties = .{
             .text = .{ .type = "string", .description = "Text to convert to speech." },
-            .voice = .{ .type = "string", .description = "Voice id (provider-specific; defaults to alloy)." },
+            .voice = .{ .type = "string", .description = "Voice id (provider-specific; falls back to agent's default)." },
             .speed = .{ .type = "number", .description = "Speed multiplier 0.25–4.0 (default 1.0)." },
         },
         .required = [_][]const u8{"text"},
     };
-    const EmptyObject = struct {};
-    const status_schema = .{ .type = "object", .properties = EmptyObject{} };
+    const no_args_schema = .{ .type = "object", .properties = EmptyObject{} };
 
     try writeResult(writer, id, .{
         .tools = .{
             .{
                 .name = "speak",
-                .description = "Queue text for the chorus broker to speak aloud.",
+                .description = "Queue text for the chorus broker to speak aloud. Long text is chunked and starts playing as soon as the first piece finishes synthesizing.",
                 .inputSchema = speak_schema,
             },
             .{
                 .name = "tts_status",
                 .description = "Return current chorus broker queue stats.",
-                .inputSchema = status_schema,
+                .inputSchema = no_args_schema,
+            },
+            .{
+                .name = "tts_pause",
+                .description = "Pause this agent's queue. Jobs already queued wait until tts_resume.",
+                .inputSchema = no_args_schema,
+            },
+            .{
+                .name = "tts_resume",
+                .description = "Resume this agent's queue.",
+                .inputSchema = no_args_schema,
+            },
+            .{
+                .name = "tts_clear",
+                .description = "Drop this agent's queued jobs and cancel what is currently playing for this agent.",
+                .inputSchema = no_args_schema,
             },
         },
     });
@@ -142,9 +157,45 @@ fn handleToolsCall(
         try forwardSpeak(allocator, io, id, args, writer);
     } else if (std.mem.eql(u8, name, "tts_status")) {
         try forwardStatus(allocator, io, id, writer);
+    } else if (std.mem.eql(u8, name, "tts_pause")) {
+        try forwardAgentOp(allocator, io, id, "pause", writer);
+    } else if (std.mem.eql(u8, name, "tts_resume")) {
+        try forwardAgentOp(allocator, io, id, "resume", writer);
+    } else if (std.mem.eql(u8, name, "tts_clear")) {
+        try forwardAgentOp(allocator, io, id, "skip", writer);
     } else {
         try writeError(writer, id, -32602, "unknown tool");
     }
+}
+
+fn forwardAgentOp(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    id: ?std.json.Value,
+    op: []const u8,
+    writer: *std.Io.Writer,
+) !void {
+    const agent_id = try client_mod.resolveAgentId(allocator);
+    defer allocator.free(agent_id);
+
+    const sock = try client_mod.defaultSocketPath(allocator);
+    defer allocator.free(sock);
+
+    var req_buf: std.Io.Writer.Allocating = .init(allocator);
+    defer req_buf.deinit();
+    try std.json.Stringify.value(.{ .op = op, .agent_id = agent_id }, .{}, &req_buf.writer);
+
+    var c = client_mod.Client.connect(allocator, io, sock) catch |err| {
+        return writeError(writer, id, -32000, @errorName(err));
+    };
+    defer c.deinit();
+
+    const reply = c.roundtrip(req_buf.written()) catch |err| {
+        return writeError(writer, id, -32000, @errorName(err));
+    };
+    defer allocator.free(reply);
+
+    try writeToolResult(writer, id, reply);
 }
 
 fn forwardSpeak(
@@ -168,8 +219,8 @@ fn forwardSpeak(
     const speed = if (a.object.get("speed")) |v| switch (v) {
         .float => |f| @as(f32, @floatCast(f)),
         .integer => |i| @as(f32, @floatFromInt(i)),
-        else => @as(f32, 1.0),
-    } else @as(f32, 1.0);
+        else => defaultSpeed(),
+    } else defaultSpeed();
 
     const agent_id = try client_mod.resolveAgentId(allocator);
     defer allocator.free(agent_id);
@@ -252,6 +303,19 @@ fn writeError(
         .@"error" = .{ .code = code, .message = message },
     }, .{}, writer);
     try writer.writeAll("\n");
+}
+
+/// Default playback speed. Reads `CHORUS_DEFAULT_SPEED` first, then the
+/// legacy `CLAUDE_TTS_SPEED` used by the old plugin. Falls back to 1.0.
+fn defaultSpeed() f32 {
+    const keys = [_][:0]const u8{ "CHORUS_DEFAULT_SPEED", "CLAUDE_TTS_SPEED" };
+    inline for (keys) |k| {
+        if (std.c.getenv(k.ptr)) |raw| {
+            const s = std.mem.span(raw);
+            if (std.fmt.parseFloat(f32, s)) |v| return v else |_| {}
+        }
+    }
+    return 1.0;
 }
 
 /// Serialize a possibly-null JSON value reference inline. Lets us pass the

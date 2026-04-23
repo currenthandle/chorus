@@ -28,6 +28,7 @@ const OpenAI = @import("providers/openai.zig").OpenAI;
 const Azure = @import("providers/azure.zig").Azure;
 const qmod = @import("queue.zig");
 const registry_mod = @import("registry.zig");
+const chunker = @import("chunker.zig");
 
 const SpeakJob = qmod.SpeakJob;
 const JobQueue = qmod.JobQueue;
@@ -176,15 +177,20 @@ pub const Daemon = struct {
 
         try self.registry.ensure(agent_id, voice);
 
-        const job: SpeakJob = .{
-            .agent_id = try self.allocator.dupe(u8, agent_id),
-            .text = try self.allocator.dupe(u8, text),
-            .voice = try self.allocator.dupe(u8, voice),
-            .speed = speed,
-        };
-        try self.queue.push(job);
+        const chunks = try chunker.split(self.allocator, text, .{});
+        defer chunker.freeChunks(self.allocator, chunks);
 
-        try okWith(writer, .{ .queued = self.queue.len() });
+        for (chunks) |chunk| {
+            const job: SpeakJob = .{
+                .agent_id = try self.allocator.dupe(u8, agent_id),
+                .text = try self.allocator.dupe(u8, chunk),
+                .voice = try self.allocator.dupe(u8, voice),
+                .speed = speed,
+            };
+            try self.queue.push(job);
+        }
+
+        try okWith(writer, .{ .queued = self.queue.len(), .chunks = chunks.len });
     }
 
     fn opStatus(self: *Daemon, writer: *std.Io.Writer) !void {
