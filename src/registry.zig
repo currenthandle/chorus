@@ -75,6 +75,16 @@ pub const Registry = struct {
         return if (self.agents.get(id)) |s| s.muted else false;
     }
 
+    /// Return a borrowed pointer to the agent's default voice, or null if
+    /// the agent hasn't been registered yet. The returned slice remains
+    /// valid while the registry holds the entry; callers should copy if
+    /// they need a stable lifetime.
+    pub fn defaultVoice(self: *Registry, id: []const u8) ?[]const u8 {
+        _ = std.c.pthread_mutex_lock(&self.mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.mutex);
+        return if (self.agents.get(id)) |s| s.default_voice else null;
+    }
+
     pub fn volume(self: *Registry, id: []const u8) f32 {
         _ = std.c.pthread_mutex_lock(&self.mutex);
         defer _ = std.c.pthread_mutex_unlock(&self.mutex);

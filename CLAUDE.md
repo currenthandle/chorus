@@ -29,36 +29,64 @@ The problem it solves: running multiple LLM agent sessions that all independentl
 
 ## Milestones
 
-1. **miniaudio binding, play file from disk.** _(complete)_
-2. TTS provider interface + OpenAI implementation (HTTP fetch MP3 bytes).
-3. Daemon skeleton: Unix socket, agent registry, `speak` forwarding.
-4. MCP shim binary: stdio JSON-RPC, forwards `speak` to daemon with tmux pane ID as agent identity.
-5. Serialize mixer: global FIFO across agents, one speaks at a time.
-6. Control CLI: `chorus pause <agent>`, `resume`, `skip`, `list`.
-7. Per-agent voice and volume configuration.
-8. Ring buffer per agent for rewind.
-9. Ducking and panning policies.
+1. miniaudio binding, play file from disk. ✅
+2. TTS provider interface + OpenAI + Azure implementations. ✅
+3. Daemon skeleton: Unix socket + agent registry + `speak` forwarding. ✅
+4. MCP shim binary: stdio JSON-RPC, forwards to daemon, uses `$TMUX_PANE` as agent identity. ✅
+5. Serialize mixer: global FIFO across agents, one speaks at a time. ✅
+6. Control CLI: `pause`, `resume`, `skip`, `list`, `mute`, `volume`, `voice`. ✅
+7. Per-agent voice and volume configuration (voice falls back to agent's default when `speak` omits it). ✅
+8. Ring buffer per agent for rewind. _(next)_
+9. Ducking + panning playback policies.
 10. TUI dashboard.
 
 ## Layout
 
 ```
 src/
-  main.zig       — entry point (currently: CLI that plays a file)
-  audio.zig      — miniaudio wrapper; playFile(path) blocks until done
+  main.zig         — CLI dispatch
+  daemon.zig       — long-running broker; Unix socket protocol; worker loop
+  client.zig       — Unix socket client + agent id resolution
+  queue.zig        — thread-safe FIFO SpeakJob queue (pthread-backed)
+  registry.zig     — per-agent state (voice, volume, paused, muted, counters)
+  audio.zig        — miniaudio wrapper; playBytes with CancelToken + volume
+  mcp_shim.zig     — MCP stdio server; forwards to the daemon
+  provider.zig     — type-erased TTS provider interface
+  providers/
+    openai.zig     — OpenAI /v1/audio/speech
+    azure.zig      — Azure OpenAI TTS deployment
 vendor/
-  miniaudio/     — single-header C library, linked via build.zig
-build.zig        — wires C include + source, links platform audio frameworks
-build.zig.zon    — Zig package manifest
+  miniaudio/       — single-header C audio library
+build.zig          — wires C include/source + platform frameworks
+build.zig.zon     — Zig package manifest
 ```
 
 ## Commands
 
 ```bash
 zig build              # build to zig-out/bin/chorus
-zig build run -- FILE  # build and play FILE
 zig build test         # run unit tests
+chorus daemon          # run the broker (owns the sound card)
+chorus mcp             # run as an MCP stdio server for Claude Code
+chorus say "hi" onyx   # enqueue speech against the running daemon
+chorus list            # inspect agents
+chorus pause <agent>   # pause/resume/skip/mute/unmute/volume/voice …
 ```
+
+## Daemon Protocol
+
+Newline-delimited JSON over a Unix socket (default
+`$XDG_RUNTIME_DIR/chorus.sock`; override with `CHORUS_SOCKET`).
+
+Requests:
+- `{"op":"speak","agent_id":"…","text":"…","voice":"…","speed":1.0}`
+- `{"op":"status"}` / `{"op":"list"}`
+- `{"op":"pause"|"resume"|"mute"|"unmute"|"skip","agent_id":"…"}`
+- `{"op":"set_voice","agent_id":"…","voice":"…"}`
+- `{"op":"set_volume","agent_id":"…","volume":0.3}`
+
+Every response is a single-line JSON object with `ok: bool` and either
+an `error` string or op-specific fields.
 
 ## Design Principles
 

@@ -163,7 +163,11 @@ pub const Daemon = struct {
     fn opSpeak(self: *Daemon, root: std.json.Value, writer: *std.Io.Writer) !void {
         const agent_id = try requireString(root, "agent_id");
         const text = try requireString(root, "text");
-        const voice = try requireString(root, "voice");
+        // Voice is optional; fall back to the agent's configured default.
+        const voice: []const u8 = if (root.object.get("voice")) |v| switch (v) {
+            .string => |s| s,
+            else => return error.BadField,
+        } else self.registry.defaultVoice(agent_id) orelse "alloy";
         const speed: f32 = if (root.object.get("speed")) |s| switch (s) {
             .float => |f| @floatCast(f),
             .integer => |i| @floatFromInt(i),
