@@ -14,6 +14,14 @@ const usage =
     \\  chorus daemon                       Run the broker daemon.
     \\  chorus say <text> [voice]           Send a speak job to the running daemon.
     \\  chorus status                       Query daemon stats.
+    \\  chorus list                         Show every registered agent.
+    \\  chorus pause <agent>                Pause an agent (queued jobs wait).
+    \\  chorus resume <agent>               Resume a paused agent.
+    \\  chorus mute <agent>                 Drop audio for an agent (jobs still drain).
+    \\  chorus unmute <agent>               Re-enable audio for an agent.
+    \\  chorus skip <agent>                 Drop this agent's queued jobs + cancel current.
+    \\  chorus voice <agent> <voice>        Set an agent's default voice.
+    \\  chorus volume <agent> <f>           Set an agent's volume multiplier.
     \\  chorus mcp                          Run as an MCP stdio server for Claude Code.
     \\
     \\Provider selected by CHORUS_PROVIDER (openai|azure), default openai.
@@ -53,9 +61,21 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (std.mem.eql(u8, cmd, "status")) {
-        try clientStatus(arena, init.io);
+        try sendSimple(arena, init.io, "{\"op\":\"status\"}");
         return;
     }
+    if (std.mem.eql(u8, cmd, "list")) {
+        try sendSimple(arena, init.io, "{\"op\":\"list\"}");
+        return;
+    }
+    if (std.mem.eql(u8, cmd, "pause")) return sendAgentOp(arena, init.io, "pause", args);
+    if (std.mem.eql(u8, cmd, "resume")) return sendAgentOp(arena, init.io, "resume", args);
+    if (std.mem.eql(u8, cmd, "mute")) return sendAgentOp(arena, init.io, "mute", args);
+    if (std.mem.eql(u8, cmd, "unmute")) return sendAgentOp(arena, init.io, "unmute", args);
+    if (std.mem.eql(u8, cmd, "skip")) return sendAgentOp(arena, init.io, "skip", args);
+    if (std.mem.eql(u8, cmd, "voice")) return sendVoiceOp(arena, init.io, args);
+    if (std.mem.eql(u8, cmd, "volume")) return sendVolumeOp(arena, init.io, args);
+
     if (std.mem.eql(u8, cmd, "mcp")) {
         try mcp_shim.run(init.gpa, init.io);
         return;
@@ -104,7 +124,7 @@ fn runSynth(
     });
     defer result.deinit(allocator);
     std.debug.print("chorus: playing {d} bytes ({s})\n", .{ result.bytes.len, @tagName(result.format) });
-    try audio.playBytes(result.bytes);
+    try audio.playBytes(result.bytes, 1.0, null);
     std.debug.print("chorus: done\n", .{});
 }
 
@@ -133,13 +153,55 @@ fn clientSay(
     std.debug.print("{s}\n", .{reply});
 }
 
-fn clientStatus(allocator: std.mem.Allocator, io: std.Io) !void {
+fn sendSimple(allocator: std.mem.Allocator, io: std.Io, request_json: []const u8) !void {
     const sock = try client_mod.defaultSocketPath(allocator);
     var c = try client_mod.Client.connect(allocator, io, sock);
     defer c.deinit();
-    const reply = try c.roundtrip("{\"op\":\"status\"}");
+    const reply = try c.roundtrip(request_json);
     defer allocator.free(reply);
     std.debug.print("{s}\n", .{reply});
+}
+
+fn sendAgentOp(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    op: []const u8,
+    args: []const [:0]const u8,
+) !void {
+    if (args.len < 3) return printUsage();
+    var buf: std.Io.Writer.Allocating = .init(allocator);
+    defer buf.deinit();
+    try std.json.Stringify.value(
+        .{ .op = op, .agent_id = args[2] },
+        .{},
+        &buf.writer,
+    );
+    try sendSimple(allocator, io, buf.written());
+}
+
+fn sendVoiceOp(allocator: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) !void {
+    if (args.len < 4) return printUsage();
+    var buf: std.Io.Writer.Allocating = .init(allocator);
+    defer buf.deinit();
+    try std.json.Stringify.value(
+        .{ .op = "set_voice", .agent_id = args[2], .voice = args[3] },
+        .{},
+        &buf.writer,
+    );
+    try sendSimple(allocator, io, buf.written());
+}
+
+fn sendVolumeOp(allocator: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) !void {
+    if (args.len < 4) return printUsage();
+    const volume = try std.fmt.parseFloat(f32, args[3]);
+    var buf: std.Io.Writer.Allocating = .init(allocator);
+    defer buf.deinit();
+    try std.json.Stringify.value(
+        .{ .op = "set_volume", .agent_id = args[2], .volume = volume },
+        .{},
+        &buf.writer,
+    );
+    try sendSimple(allocator, io, buf.written());
 }
 
 const ProviderKind = enum { openai, azure };

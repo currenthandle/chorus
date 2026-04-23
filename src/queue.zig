@@ -78,6 +78,27 @@ pub const JobQueue = struct {
         defer _ = std.c.pthread_mutex_unlock(&self.mutex);
         return self.jobs.items.len;
     }
+
+    /// Remove every queued job whose `agent_id` matches. Returns the number
+    /// of jobs dropped. The currently-playing job (already popped) is
+    /// unaffected — the daemon cancels it separately.
+    pub fn dropByAgent(self: *JobQueue, agent_id: []const u8) usize {
+        _ = std.c.pthread_mutex_lock(&self.mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.mutex);
+
+        var removed: usize = 0;
+        var i: usize = 0;
+        while (i < self.jobs.items.len) {
+            if (std.mem.eql(u8, self.jobs.items[i].agent_id, agent_id)) {
+                const job = self.jobs.orderedRemove(i);
+                job.deinit(self.allocator);
+                removed += 1;
+            } else {
+                i += 1;
+            }
+        }
+        return removed;
+    }
 };
 
 test "queue push then pop returns job" {
