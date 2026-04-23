@@ -92,7 +92,10 @@ pub const ElevenLabs = struct {
             .voice_settings = .{
                 .stability = 0.5,
                 .similarity_boost = 0.75,
-                .speed = req.speed,
+                // ElevenLabs requires speed in [0.7, 1.2]. Clamp slightly
+                // inside the bound so f32 → JSON stringification doesn't
+                // overshoot (e.g. 1.2f serializes as 1.20000004...).
+                .speed = std.math.clamp(req.speed, 0.7, 1.19),
             },
         }, .{}, &body_buf.writer);
 
