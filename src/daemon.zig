@@ -46,6 +46,14 @@ pub const Daemon = struct {
     provider_kind: ProviderKind,
     socket_path: []u8,
 
+    /// Daemon-wide default for auto-speak. When false, queued jobs sit in
+    /// the queue until a client calls `next`. Per-agent overrides in the
+    /// registry take precedence. Defaults to true so existing behavior
+    /// (immediate speech) is preserved.
+    auto_speak_default: std.atomic.Value(bool) = .init(true),
+    wake_worker: std.c.pthread_cond_t = std.c.PTHREAD_COND_INITIALIZER,
+    wake_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
+
     current_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
     current_agent: ?[]u8 = null,
     current_cancel: audio.CancelToken = .{},
@@ -158,9 +166,16 @@ pub const Daemon = struct {
         if (std.mem.eql(u8, op, "skip")) return self.opSkip(root, writer);
         if (std.mem.eql(u8, op, "set_voice")) return self.opSetVoice(root, writer);
         if (std.mem.eql(u8, op, "set_volume")) return self.opSetVolume(root, writer);
+        if (std.mem.eql(u8, op, "set_auto_speak")) return self.opSetAutoSpeak(root, writer);
+        if (std.mem.eql(u8, op, "indicators")) return self.opIndicators(writer);
+        if (std.mem.eql(u8, op, "next")) return self.opNext(root, writer);
 
         return error.UnknownOp;
     }
+
+    // Expose internals for the worker's locked scan in claimNextJob.
+    // (Re-entry through Registry's own mutex is fine; the two locks are
+    // independent and we always take queue first, registry second.)
 
     fn opSpeak(self: *Daemon, root: std.json.Value, writer: *std.Io.Writer) !void {
         const agent_id = try requireString(root, "agent_id");
@@ -191,6 +206,7 @@ pub const Daemon = struct {
             try self.queue.push(job);
         }
 
+        self.wakeWorker();
         try okWith(writer, .{ .queued = self.queue.len(), .chunks = chunks.len });
     }
 
@@ -251,6 +267,86 @@ pub const Daemon = struct {
         try okWith(writer, .{});
     }
 
+    fn opSetAutoSpeak(self: *Daemon, root: std.json.Value, writer: *std.Io.Writer) !void {
+        const enabled_v = root.object.get("enabled") orelse return error.MissingEnabled;
+        if (enabled_v != .bool) return error.BadField;
+        const enabled = enabled_v.bool;
+
+        if (root.object.get("agent_id")) |a| {
+            if (a != .string) return error.BadField;
+            try self.registry.setAutoSpeak(a.string, enabled);
+        } else {
+            self.auto_speak_default.store(enabled, .release);
+        }
+        self.wakeWorker();
+        try okWith(writer, .{ .auto_speak = enabled });
+    }
+
+    fn opIndicators(self: *Daemon, writer: *std.Io.Writer) !void {
+        var counts = try self.queue.countByAgent(self.allocator);
+        defer counts.deinit(self.allocator);
+
+        // Serialize as an array of {agent_id, waiting} objects so tmux
+        // scripts can iterate without JSON-path gymnastics.
+        try writer.writeAll("{\"ok\":true,\"indicators\":[");
+        var it = counts.iterator();
+        var first = true;
+        while (it.next()) |entry| {
+            if (!first) try writer.writeAll(",");
+            first = false;
+            const effective = self.registry.effectiveAutoSpeak(
+                entry.key_ptr.*,
+                self.auto_speak_default.load(.acquire),
+            );
+            try std.json.Stringify.value(.{
+                .agent_id = entry.key_ptr.*,
+                .waiting = entry.value_ptr.*,
+                .auto_speak = effective,
+            }, .{}, writer);
+        }
+        try writer.writeAll("]}\n");
+    }
+
+    fn opNext(self: *Daemon, root: std.json.Value, writer: *std.Io.Writer) !void {
+        const agent_opt = if (root.object.get("agent_id")) |v| switch (v) {
+            .string => |s| s,
+            else => return error.BadField,
+        } else null;
+
+        // Mark the chosen agent (or all) as auto-speak for exactly one job
+        // by popping directly and handing to the worker. Simpler path: pop
+        // the first matching job and push it into a priority slot.
+        if (agent_opt) |agent| {
+            const job = self.queue.popAgent(agent) orelse {
+                try okWith(writer, .{ .promoted = false });
+                return;
+            };
+            try self.queue.pushFront(job);
+        } else {
+            // No specific agent: pop the head that is currently waiting
+            // behind auto-speak=false. Nothing to do if head is already
+            // eligible.
+            const head = self.queue.peekHeadAgent(self.allocator) orelse {
+                try okWith(writer, .{ .promoted = false });
+                return;
+            };
+            defer self.allocator.free(head);
+            const job = self.queue.popAgent(head) orelse {
+                try okWith(writer, .{ .promoted = false });
+                return;
+            };
+            try self.queue.pushFront(job);
+        }
+        self.wakeWorker();
+        try okWith(writer, .{ .promoted = true });
+    }
+
+    fn wakeWorker(self: *Daemon) void {
+        _ = std.c.pthread_mutex_lock(&self.wake_mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.wake_mutex);
+        _ = std.c.pthread_cond_broadcast(&self.wake_worker);
+    }
+
     fn opSetVolume(self: *Daemon, root: std.json.Value, writer: *std.Io.Writer) !void {
         const agent_id = try requireString(root, "agent_id");
         const volume_v = root.object.get("volume") orelse return error.MissingVolume;
@@ -270,31 +366,15 @@ pub const Daemon = struct {
     }
 
     fn workerLoop(self: *Daemon) void {
-        while (self.queue.pop()) |job| {
-            defer job.deinit(self.allocator);
-
-            // If the agent is paused, re-queue at the tail so other agents
-            // keep flowing and try again later.
-            if (self.registry.isPaused(job.agent_id)) {
-                const requeued: SpeakJob = .{
-                    .agent_id = self.allocator.dupe(u8, job.agent_id) catch continue,
-                    .text = self.allocator.dupe(u8, job.text) catch {
-                        self.allocator.free(job.agent_id);
-                        continue;
-                    },
-                    .voice = self.allocator.dupe(u8, job.voice) catch {
-                        self.allocator.free(job.agent_id);
-                        self.allocator.free(job.text);
-                        continue;
-                    },
-                    .speed = job.speed,
-                };
-                self.queue.push(requeued) catch requeued.deinit(self.allocator);
-                // Avoid a tight spin when the whole queue is paused.
-                const ts = std.c.timespec{ .sec = 0, .nsec = 50 * std.time.ns_per_ms };
-                _ = std.c.nanosleep(&ts, null);
+        while (true) {
+            const job_opt = self.claimNextJob() orelse {
+                // Nothing eligible right now. Wait for a signal (new job,
+                // resume, or next promotion).
+                self.waitForWake(100);
                 continue;
-            }
+            };
+            var job = job_opt;
+            defer job.deinit(self.allocator);
 
             self.setCurrent(job.agent_id);
             defer self.clearCurrent();
@@ -309,6 +389,47 @@ pub const Daemon = struct {
             self.registry.recordProcessed(job.agent_id, job.text);
             _ = self.stats.processed.fetchAdd(1, .monotonic);
         }
+    }
+
+    /// Pop the next job the worker is allowed to play. Skips jobs for
+    /// paused or hand-raise agents without removing them. Returns null if
+    /// nothing is currently eligible.
+    fn claimNextJob(self: *Daemon) ?SpeakJob {
+        const default_auto = self.auto_speak_default.load(.acquire);
+
+        // Linear scan under a single lock so we can honor FIFO among
+        // eligible agents while leaving ineligible jobs in place.
+        _ = std.c.pthread_mutex_lock(&self.queue.mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.queue.mutex);
+        var i: usize = 0;
+        while (i < self.queue.jobs.items.len) : (i += 1) {
+            const job = self.queue.jobs.items[i];
+            if (self.registry.isPaused(job.agent_id)) continue;
+            // Priority jobs (promoted via `next`) skip the auto-speak gate.
+            if (!job.priority and
+                !self.registry.effectiveAutoSpeak(job.agent_id, default_auto))
+                continue;
+            return self.queue.jobs.orderedRemove(i);
+        }
+        return null;
+    }
+
+    fn waitForWake(self: *Daemon, timeout_ms: u32) void {
+        _ = std.c.pthread_mutex_lock(&self.wake_mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.wake_mutex);
+        const ts: std.c.timespec = .{
+            .sec = 0,
+            .nsec = @intCast(timeout_ms * std.time.ns_per_ms),
+        };
+        var abs: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(.REALTIME, &abs);
+        abs.sec += ts.sec;
+        abs.nsec += ts.nsec;
+        if (abs.nsec >= std.time.ns_per_s) {
+            abs.sec += 1;
+            abs.nsec -= std.time.ns_per_s;
+        }
+        _ = std.c.pthread_cond_timedwait(&self.wake_worker, &self.wake_mutex, &abs);
     }
 
     fn setCurrent(self: *Daemon, agent_id: []const u8) void {

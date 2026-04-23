@@ -14,6 +14,11 @@ pub const AgentState = struct {
     volume: f32 = 1.0,
     paused: bool = false,
     muted: bool = false,
+    /// Per-agent auto-speak override. `null` = inherit from daemon default.
+    /// `false` = this agent's jobs stay queued until the user explicitly
+    /// calls `next`. `true` = always speak immediately when queue reaches
+    /// it.
+    auto_speak: ?bool = null,
     processed: u64 = 0,
     last_text: ?[]const u8 = null,
 
@@ -30,6 +35,7 @@ pub const Snapshot = struct {
     volume: f32,
     paused: bool,
     muted: bool,
+    auto_speak: ?bool,
     processed: u64,
 };
 
@@ -112,6 +118,22 @@ pub const Registry = struct {
         if (self.agents.getPtr(id)) |s| s.volume = v;
     }
 
+    pub fn setAutoSpeak(self: *Registry, id: []const u8, value: ?bool) !void {
+        try self.ensure(id, "alloy");
+        _ = std.c.pthread_mutex_lock(&self.mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.mutex);
+        if (self.agents.getPtr(id)) |s| s.auto_speak = value;
+    }
+
+    /// Resolve the effective auto-speak flag for an agent, falling back to
+    /// the daemon-wide default when the agent hasn't set an override.
+    pub fn effectiveAutoSpeak(self: *Registry, id: []const u8, default: bool) bool {
+        _ = std.c.pthread_mutex_lock(&self.mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.mutex);
+        const s = self.agents.get(id) orelse return default;
+        return s.auto_speak orelse default;
+    }
+
     pub fn setDefaultVoice(self: *Registry, id: []const u8, voice: []const u8) !void {
         try self.ensure(id, voice);
         _ = std.c.pthread_mutex_lock(&self.mutex);
@@ -156,6 +178,7 @@ pub const Registry = struct {
                 .volume = s.volume,
                 .paused = s.paused,
                 .muted = s.muted,
+                .auto_speak = s.auto_speak,
                 .processed = s.processed,
             });
         }

@@ -19,6 +19,9 @@ pub const SpeakJob = struct {
     voice: []const u8,
     /// Playback speed multiplier.
     speed: f32 = 1.0,
+    /// True when a client explicitly promoted this job via `next`. Priority
+    /// jobs bypass the auto-speak gate (but still respect pause/mute).
+    priority: bool = false,
 
     pub fn deinit(self: SpeakJob, allocator: std.mem.Allocator) void {
         allocator.free(self.agent_id);
@@ -54,6 +57,27 @@ pub const JobQueue = struct {
         _ = std.c.pthread_cond_signal(&self.cond);
     }
 
+    /// Insert a job at the front of the queue with the priority flag set.
+    /// Used by `next` to promote a hand-raised job past the auto-speak
+    /// gate.
+    pub fn pushFront(self: *JobQueue, job: SpeakJob) !void {
+        _ = std.c.pthread_mutex_lock(&self.mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.mutex);
+        var promoted = job;
+        promoted.priority = true;
+        try self.jobs.insert(self.allocator, 0, promoted);
+        _ = std.c.pthread_cond_signal(&self.cond);
+    }
+
+    /// Copy out the agent id of the oldest queued job, or null if empty.
+    /// Caller owns the returned slice.
+    pub fn peekHeadAgent(self: *JobQueue, allocator: std.mem.Allocator) ?[]u8 {
+        _ = std.c.pthread_mutex_lock(&self.mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.mutex);
+        if (self.jobs.items.len == 0) return null;
+        return allocator.dupe(u8, self.jobs.items[0].agent_id) catch null;
+    }
+
     /// Blocks until a job is available or the queue is closed. Returns null
     /// when the queue has been closed and drained.
     pub fn pop(self: *JobQueue) ?SpeakJob {
@@ -77,6 +101,59 @@ pub const JobQueue = struct {
         _ = std.c.pthread_mutex_lock(&self.mutex);
         defer _ = std.c.pthread_mutex_unlock(&self.mutex);
         return self.jobs.items.len;
+    }
+
+    /// Pop the oldest queued job matching `agent_id`. Returns null if no
+    /// such job exists or the queue is empty. Unlike `pop`, this never
+    /// blocks.
+    pub fn popAgent(self: *JobQueue, agent_id: []const u8) ?SpeakJob {
+        _ = std.c.pthread_mutex_lock(&self.mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.mutex);
+        var i: usize = 0;
+        while (i < self.jobs.items.len) : (i += 1) {
+            if (std.mem.eql(u8, self.jobs.items[i].agent_id, agent_id)) {
+                return self.jobs.orderedRemove(i);
+            }
+        }
+        return null;
+    }
+
+    /// Count queued jobs per agent. Returns a map of agent_id → count.
+    /// Caller owns the map and should call `deinit` on it.
+    pub fn countByAgent(
+        self: *JobQueue,
+        allocator: std.mem.Allocator,
+    ) !std.StringHashMapUnmanaged(usize) {
+        _ = std.c.pthread_mutex_lock(&self.mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.mutex);
+        var out: std.StringHashMapUnmanaged(usize) = .empty;
+        errdefer out.deinit(allocator);
+        for (self.jobs.items) |job| {
+            const gop = try out.getOrPut(allocator, job.agent_id);
+            if (!gop.found_existing) gop.value_ptr.* = 0;
+            gop.value_ptr.* += 1;
+        }
+        return out;
+    }
+
+    /// Pop the oldest queued job whose agent has `auto_speak` enabled.
+    /// Skip past jobs for hand-raise agents without removing them. Returns
+    /// null if no auto-speak job is available (but other jobs may still
+    /// be queued waiting for attention).
+    pub fn popAutoSpeakable(
+        self: *JobQueue,
+        comptime shouldSpeak: fn (ctx: *anyopaque, agent_id: []const u8) bool,
+        ctx: *anyopaque,
+    ) ?SpeakJob {
+        _ = std.c.pthread_mutex_lock(&self.mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.mutex);
+        var i: usize = 0;
+        while (i < self.jobs.items.len) : (i += 1) {
+            if (shouldSpeak(ctx, self.jobs.items[i].agent_id)) {
+                return self.jobs.orderedRemove(i);
+            }
+        }
+        return null;
     }
 
     /// Remove every queued job whose `agent_id` matches. Returns the number

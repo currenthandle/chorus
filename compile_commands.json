@@ -1,0 +1,15 @@
+[
+  {
+    "directory": "/Users/casey/Dev/chorus",
+    "file": "/Users/casey/Dev/chorus/vendor/miniaudio/miniaudio.c",
+    "arguments": [
+      "/opt/homebrew/opt/llvm/bin/clang",
+      "-std=c11",
+      "-fno-sanitize=undefined",
+      "-DMA_NO_RUNTIME_LINKING",
+      "-I/Users/casey/Dev/chorus/vendor/miniaudio",
+      "-c",
+      "/Users/casey/Dev/chorus/vendor/miniaudio/miniaudio.c"
+    ]
+  }
+]

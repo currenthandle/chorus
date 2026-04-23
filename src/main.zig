@@ -23,6 +23,9 @@ const usage =
     \\  chorus skip <agent>                 Drop this agent's queued jobs + cancel current.
     \\  chorus voice <agent> <voice>        Set an agent's default voice.
     \\  chorus volume <agent> <f>           Set an agent's volume multiplier.
+    \\  chorus auto on|off [agent]          Toggle auto-speak globally or for one agent.
+    \\  chorus indicators                   Show which agents have queued audio waiting.
+    \\  chorus next [agent]                 Play the next job (optionally from a specific agent).
     \\  chorus mcp                          Run as an MCP stdio server for Claude Code.
     \\
     \\Provider selected by CHORUS_PROVIDER (openai|azure), default openai.
@@ -76,6 +79,12 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, cmd, "skip")) return sendAgentOp(arena, init.io, "skip", args);
     if (std.mem.eql(u8, cmd, "voice")) return sendVoiceOp(arena, init.io, args);
     if (std.mem.eql(u8, cmd, "volume")) return sendVolumeOp(arena, init.io, args);
+    if (std.mem.eql(u8, cmd, "auto")) return sendAutoOp(arena, init.io, args);
+    if (std.mem.eql(u8, cmd, "indicators")) {
+        try sendSimple(arena, init.io, "{\"op\":\"indicators\"}");
+        return;
+    }
+    if (std.mem.eql(u8, cmd, "next")) return sendNextOp(arena, init.io, args);
 
     if (std.mem.eql(u8, cmd, "mcp")) {
         try mcp_shim.run(init.gpa, init.io);
@@ -194,6 +203,44 @@ fn sendVoiceOp(allocator: std.mem.Allocator, io: std.Io, args: []const [:0]const
         .{},
         &buf.writer,
     );
+    try sendSimple(allocator, io, buf.written());
+}
+
+fn sendAutoOp(allocator: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) !void {
+    if (args.len < 3) return printUsage();
+    const enabled = std.mem.eql(u8, args[2], "on");
+    if (!enabled and !std.mem.eql(u8, args[2], "off")) return printUsage();
+
+    var buf: std.Io.Writer.Allocating = .init(allocator);
+    defer buf.deinit();
+    if (args.len >= 4) {
+        try std.json.Stringify.value(
+            .{ .op = "set_auto_speak", .enabled = enabled, .agent_id = args[3] },
+            .{},
+            &buf.writer,
+        );
+    } else {
+        try std.json.Stringify.value(
+            .{ .op = "set_auto_speak", .enabled = enabled },
+            .{},
+            &buf.writer,
+        );
+    }
+    try sendSimple(allocator, io, buf.written());
+}
+
+fn sendNextOp(allocator: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) !void {
+    var buf: std.Io.Writer.Allocating = .init(allocator);
+    defer buf.deinit();
+    if (args.len >= 3) {
+        try std.json.Stringify.value(
+            .{ .op = "next", .agent_id = args[2] },
+            .{},
+            &buf.writer,
+        );
+    } else {
+        try buf.writer.writeAll("{\"op\":\"next\"}");
+    }
     try sendSimple(allocator, io, buf.written());
 }
 
