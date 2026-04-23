@@ -58,6 +58,16 @@ chorus status
 
 Each Claude Code session launches `chorus mcp` as its MCP stdio server. The shim resolves the session's tmux pane ID (`$TMUX_PANE`) as the agent identity and forwards `speak` calls to the daemon.
 
+## Tmux Integration
+
+Chorus exposes a hand-raise model: flip `chorus auto off` and nothing plays automatically — queued audio waits until you pick who speaks next. Tmux is the natural UI for that.
+
+See `examples/tmux.conf.snippet` for a drop-in config. It wires up:
+
+- A status-right summary: `[🙋alice:1] [🙋bob:2]` — each agent with waiting audio.
+- A per-pane badge in the pane border showing `🙋N` when that pane's agent has queued speech.
+- `prefix + n` to play the oldest waiting agent, `prefix + N` to play this pane's next job, `prefix + H`/`A` to toggle global auto-speak.
+
 ## Layout
 
 ```

@@ -26,6 +26,8 @@ const usage =
     \\  chorus auto on|off [agent]          Toggle auto-speak globally or for one agent.
     \\  chorus indicators                   Show which agents have queued audio waiting.
     \\  chorus next [agent]                 Play the next job (optionally from a specific agent).
+    \\  chorus tmux-status                  One-line summary for tmux status-right.
+    \\  chorus tmux-pane [pane_id]          Badge for $TMUX_PANE (or given id).
     \\  chorus mcp                          Run as an MCP stdio server for Claude Code.
     \\
     \\Provider selected by CHORUS_PROVIDER (openai|azure), default openai.
@@ -85,6 +87,8 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (std.mem.eql(u8, cmd, "next")) return sendNextOp(arena, init.io, args);
+    if (std.mem.eql(u8, cmd, "tmux-status")) return tmuxStatus(arena, init.io);
+    if (std.mem.eql(u8, cmd, "tmux-pane")) return tmuxPane(arena, init.io, args);
 
     if (std.mem.eql(u8, cmd, "mcp")) {
         try mcp_shim.run(init.gpa, init.io);
@@ -227,6 +231,90 @@ fn sendAutoOp(allocator: std.mem.Allocator, io: std.Io, args: []const [:0]const 
         );
     }
     try sendSimple(allocator, io, buf.written());
+}
+
+fn tmuxStatus(allocator: std.mem.Allocator, io: std.Io) !void {
+    const reply = fetchIndicators(allocator, io) catch {
+        // Silent on error — status lines must not spam on daemon bounces.
+        return;
+    };
+    defer allocator.free(reply);
+    try renderIndicators(reply, allocator);
+}
+
+fn tmuxPane(allocator: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) !void {
+    const pane_id = if (args.len >= 3)
+        args[2]
+    else blk: {
+        const raw = std.c.getenv("TMUX_PANE") orelse return;
+        break :blk std.mem.span(raw);
+    };
+
+    const reply = fetchIndicators(allocator, io) catch return;
+    defer allocator.free(reply);
+
+    // Parse and find this pane's entry.
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, reply, .{}) catch return;
+    defer parsed.deinit();
+
+    const indicators = parsed.value.object.get("indicators") orelse return;
+    if (indicators != .array) return;
+
+    for (indicators.array.items) |ind| {
+        if (ind != .object) continue;
+        const id_v = ind.object.get("agent_id") orelse continue;
+        if (id_v != .string) continue;
+        if (!std.mem.eql(u8, id_v.string, pane_id)) continue;
+
+        const waiting = ind.object.get("waiting") orelse continue;
+        const count: u64 = switch (waiting) {
+            .integer => |i| @intCast(i),
+            else => 0,
+        };
+        const auto_v = ind.object.get("auto_speak");
+        const is_auto = auto_v != null and auto_v.? == .bool and auto_v.?.bool;
+        const glyph = if (is_auto) "🔊" else "🙋";
+
+        var buf: [256]u8 = undefined;
+        const s = try std.fmt.bufPrint(&buf, "{s}{d}", .{ glyph, count });
+        _ = std.c.write(1, s.ptr, s.len);
+        return;
+    }
+}
+
+fn fetchIndicators(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
+    const sock = try client_mod.defaultSocketPath(allocator);
+    defer allocator.free(sock);
+    var c = try client_mod.Client.connect(allocator, io, sock);
+    defer c.deinit();
+    return c.roundtrip("{\"op\":\"indicators\"}");
+}
+
+fn renderIndicators(reply: []const u8, allocator: std.mem.Allocator) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, reply, .{}) catch return;
+    defer parsed.deinit();
+
+    const indicators = parsed.value.object.get("indicators") orelse return;
+    if (indicators != .array) return;
+    if (indicators.array.items.len == 0) return;
+
+    var buf: [4096]u8 = undefined;
+    var fbs = std.Io.Writer.fixed(&buf);
+    for (indicators.array.items, 0..) |ind, i| {
+        if (ind != .object) continue;
+        const id_v = ind.object.get("agent_id") orelse continue;
+        const waiting_v = ind.object.get("waiting") orelse continue;
+        if (id_v != .string or waiting_v != .integer) continue;
+
+        const auto_v = ind.object.get("auto_speak");
+        const is_auto = auto_v != null and auto_v.? == .bool and auto_v.?.bool;
+        const glyph = if (is_auto) "🔊" else "🙋";
+
+        if (i > 0) try fbs.writeAll(" ");
+        try fbs.print("[{s}{s}:{d}]", .{ glyph, id_v.string, waiting_v.integer });
+    }
+    const out = fbs.buffered();
+    _ = std.c.write(1, out.ptr, out.len);
 }
 
 fn sendNextOp(allocator: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) !void {

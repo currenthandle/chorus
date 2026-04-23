@@ -1,0 +1,33 @@
+# chorus tmux integration
+#
+# Drop these lines into ~/.tmux.conf (or source this file). They:
+#   1. Refresh the status line once per second so the chorus badges update.
+#   2. Show a global summary of every agent with waiting audio in status-right.
+#   3. Show a per-pane badge in the pane title when that pane's agent has
+#      queued audio.
+#   4. Bind prefix + n to "play the next queued job" and prefix + N to
+#      "play this pane's next queued job" specifically.
+#
+# Assumes `chorus` is on PATH. If not, replace with the absolute path
+# (e.g. /Users/casey/Dev/chorus/zig-out/bin/chorus).
+
+set -g status-interval 1
+
+set -g status-right '#(chorus tmux-status) | %H:%M'
+
+# Per-pane hand-raise badge. Tmux evaluates #{pane_title} and we let chorus
+# emit the badge (or nothing when that pane has no waiting audio).
+set -g pane-border-status top
+set -g pane-border-format " #{pane_index} #(chorus tmux-pane #{pane_id}) "
+
+# prefix + n: promote the oldest waiting agent (the whole queue's head).
+bind-key n run-shell "chorus next"
+
+# prefix + N (shift-n): promote this pane's next job specifically.
+bind-key N run-shell "chorus next #{pane_id}"
+
+# prefix + H: toggle global auto-speak off (hand-raise mode for everyone).
+bind-key H run-shell "chorus auto off"
+
+# prefix + A: toggle global auto-speak back on.
+bind-key A run-shell "chorus auto on"
