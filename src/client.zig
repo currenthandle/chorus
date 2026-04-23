@@ -38,16 +38,15 @@ pub const Client = struct {
 };
 
 /// Compute the default socket path, mirroring the daemon's logic.
+///
+/// Defaults to `/tmp/chorus.sock` so CLI invocations from arbitrary shells
+/// (tmux `run-shell`, cron, etc.) find the daemon without per-shell env
+/// setup. Override via `CHORUS_SOCKET` when running multiple daemons.
 pub fn defaultSocketPath(allocator: std.mem.Allocator) ![]u8 {
     if (std.c.getenv("CHORUS_SOCKET")) |raw| {
         return allocator.dupe(u8, std.mem.span(raw));
     }
-    if (std.c.getenv("XDG_RUNTIME_DIR")) |raw| {
-        const dir = std.mem.span(raw);
-        return std.fmt.allocPrint(allocator, "{s}/chorus.sock", .{dir});
-    }
-    const user = if (std.c.getenv("USER")) |u| std.mem.span(u) else "user";
-    return std.fmt.allocPrint(allocator, "/tmp/chorus-{s}.sock", .{user});
+    return allocator.dupe(u8, "/tmp/chorus.sock");
 }
 
 /// Resolve the agent identity for the current process. Prefers $TMUX_PANE

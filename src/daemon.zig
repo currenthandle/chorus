@@ -530,10 +530,5 @@ fn defaultSocketPath(allocator: std.mem.Allocator) ![]u8 {
     if (std.c.getenv("CHORUS_SOCKET")) |raw| {
         return allocator.dupe(u8, std.mem.span(raw));
     }
-    if (std.c.getenv("XDG_RUNTIME_DIR")) |raw| {
-        const dir = std.mem.span(raw);
-        return std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, default_socket_suffix });
-    }
-    const user = if (std.c.getenv("USER")) |u| std.mem.span(u) else "user";
-    return std.fmt.allocPrint(allocator, "/tmp/chorus-{s}.sock", .{user});
+    return allocator.dupe(u8, "/tmp/chorus.sock");
 }
