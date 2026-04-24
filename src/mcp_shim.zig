@@ -211,10 +211,13 @@ fn forwardSpeak(
     const text_v = a.object.get("text") orelse return writeError(writer, id, -32602, "missing text");
     if (text_v != .string) return writeError(writer, id, -32602, "text must be string");
 
-    const voice = if (a.object.get("voice")) |v| switch (v) {
+    // Only forward `voice` when the tool call actually supplied one.
+    // Omitting it lets the daemon fall back to the agent's round-robin
+    // default voice — which is the whole point of per-agent voices.
+    const voice_opt: ?[]const u8 = if (a.object.get("voice")) |v| switch (v) {
         .string => |s| s,
-        else => "alloy",
-    } else "alloy";
+        else => null,
+    } else null;
 
     const speed = if (a.object.get("speed")) |v| switch (v) {
         .float => |f| @as(f32, @floatCast(f)),
@@ -230,13 +233,22 @@ fn forwardSpeak(
 
     var req_buf: std.Io.Writer.Allocating = .init(allocator);
     defer req_buf.deinit();
-    try std.json.Stringify.value(.{
-        .op = "speak",
-        .agent_id = agent_id,
-        .text = text_v.string,
-        .voice = voice,
-        .speed = speed,
-    }, .{}, &req_buf.writer);
+    if (voice_opt) |voice| {
+        try std.json.Stringify.value(.{
+            .op = "speak",
+            .agent_id = agent_id,
+            .text = text_v.string,
+            .voice = voice,
+            .speed = speed,
+        }, .{}, &req_buf.writer);
+    } else {
+        try std.json.Stringify.value(.{
+            .op = "speak",
+            .agent_id = agent_id,
+            .text = text_v.string,
+            .speed = speed,
+        }, .{}, &req_buf.writer);
+    }
 
     var c = client_mod.Client.connect(allocator, io, sock) catch |err| {
         return writeError(writer, id, -32000, @errorName(err));

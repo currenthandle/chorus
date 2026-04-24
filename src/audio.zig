@@ -28,35 +28,74 @@ pub const CancelToken = struct {
     }
 };
 
-/// Persistent audio engine. Hold one across the life of the daemon so we
-/// don't pay device-open / engine-init cost between chunks. Playback is
-/// driven by `playBytes` which decodes into a fresh `ma_sound` but keeps
-/// the engine / audio device running continuously between chunks.
+/// Shared with miniaudio's notification callback. Set from the audio thread
+/// whenever the output device changes state; polled by Player.play before
+/// it opens a new sound so the engine is rebuilt on a clean device config.
+///
+/// We use a plain global because miniaudio's notification struct exposes a
+/// `pUserData` slot only via the device we create; wiring that through the
+/// engine requires building a pre-initialized ma_device ourselves. The
+/// daemon only runs one player, so a single global flag is enough.
+var device_dirty: std.atomic.Value(bool) = .init(false);
+
+fn onDeviceNotification(notif: [*c]const c.ma_device_notification) callconv(.c) void {
+    const n = notif.*;
+    switch (n.type) {
+        c.ma_device_notification_type_rerouted,
+        c.ma_device_notification_type_interruption_began,
+        c.ma_device_notification_type_interruption_ended,
+        c.ma_device_notification_type_unlocked,
+        => device_dirty.store(true, .release),
+        else => {},
+    }
+}
+
+/// Persistent audio engine that rebuilds itself when macOS rearranges the
+/// audio stack (e.g. Superwhisper grabs the mic, Bluetooth device comes
+/// online, user switches output). Without this, the engine can get stuck
+/// on a torn-down device and drop audio for seconds at a time.
 pub const Player = struct {
     engine: c.ma_engine,
     initialized: bool = false,
 
     pub fn init(self: *Player) !void {
-        if (c.ma_engine_init(null, &self.engine) != c.MA_SUCCESS) {
-            return AudioError.EngineInitFailed;
-        }
-        self.initialized = true;
+        try self.openEngine();
     }
 
     pub fn deinit(self: *Player) void {
+        self.closeEngine();
+    }
+
+    fn openEngine(self: *Player) !void {
+        var cfg = c.ma_engine_config_init();
+        cfg.notificationCallback = onDeviceNotification;
+        if (c.ma_engine_init(&cfg, &self.engine) != c.MA_SUCCESS) {
+            return AudioError.EngineInitFailed;
+        }
+        self.initialized = true;
+        device_dirty.store(false, .release);
+    }
+
+    fn closeEngine(self: *Player) void {
         if (self.initialized) {
             c.ma_engine_uninit(&self.engine);
             self.initialized = false;
         }
     }
 
-    /// Play in-memory bytes through the persistent engine. Blocks until
-    /// playback completes or `cancel` is tripped. The decoder is held on
-    /// the stack of this call and torn down after the sound ends; only
-    /// the engine + device persists between calls, which is where the
-    /// latency savings live.
+    fn maybeRebuild(self: *Player) !void {
+        if (!device_dirty.load(.acquire)) return;
+        std.debug.print("chorus-audio: device changed, reopening engine\n", .{});
+        self.closeEngine();
+        try self.openEngine();
+    }
+
+    /// Play in-memory bytes through the engine. Rebuilds the engine first
+    /// if the device has been re-routed since the last call.
     pub fn play(self: *Player, bytes: []const u8, volume: f32, cancel: ?*CancelToken) !void {
         if (cancel) |tok| if (tok.isCancelled()) return;
+
+        try self.maybeRebuild();
 
         var decoder: c.ma_decoder = undefined;
         const dec_cfg = c.ma_decoder_config_init_default();
@@ -83,15 +122,20 @@ pub const Player = struct {
             return AudioError.PlaybackFailed;
         }
 
-        // Tight poll: 5ms granularity so the play thread reacts to the
-        // end-of-sound almost immediately and can pick up the next ready
-        // chunk with minimal gap. CPU cost is negligible at 5ms.
+        // Tight poll: 5ms granularity so the play thread reacts to end-of-
+        // sound almost immediately. Also checks for device rerouting
+        // mid-playback and aborts cleanly so the next chunk gets a fresh
+        // engine rather than continuing to drain into a stale device.
         while (c.ma_sound_is_playing(&sound) != 0) {
             if (cancel) |tok| {
                 if (tok.isCancelled()) {
                     _ = c.ma_sound_stop(&sound);
                     return;
                 }
+            }
+            if (device_dirty.load(.acquire)) {
+                _ = c.ma_sound_stop(&sound);
+                return;
             }
             sleepMs(5);
         }
