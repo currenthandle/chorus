@@ -12,8 +12,12 @@
 
 const std = @import("std");
 
-pub const default_max_chunk_len: usize = 240;
-pub const default_min_chunk_len: usize = 24;
+// Tuned for ElevenLabs Flash: want the first chunk to start speaking
+// quickly (so small-ish first chunk helps), but subsequent chunks should
+// be generously large so the pipeline doesn't thrash and synthesis
+// latency amortizes over more audio per round trip.
+pub const default_max_chunk_len: usize = 400;
+pub const default_min_chunk_len: usize = 60;
 
 pub const Options = struct {
     max_chunk_len: usize = default_max_chunk_len,

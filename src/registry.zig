@@ -43,6 +43,11 @@ pub const Registry = struct {
     allocator: std.mem.Allocator,
     mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
     agents: std.StringHashMapUnmanaged(AgentState) = .empty,
+    /// Round-robin pointer into the voice pool for new agents. Assigning
+    /// distinct voices as agents register makes sessions audibly different
+    /// without the user having to configure anything.
+    voice_pool: []const []const u8 = &.{},
+    voice_cursor: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) Registry {
         return .{ .allocator = allocator };
@@ -57,14 +62,31 @@ pub const Registry = struct {
         _ = std.c.pthread_mutex_destroy(&self.mutex);
     }
 
+    /// True if the registry already has an entry for this agent id.
+    pub fn hasAgent(self: *Registry, id: []const u8) bool {
+        _ = std.c.pthread_mutex_lock(&self.mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.mutex);
+        return self.agents.contains(id);
+    }
+
     /// Ensure an agent entry exists, creating it with defaults on first touch.
+    ///
+    /// When a voice pool is configured, new agents are assigned the next
+    /// voice round-robin instead of the caller-provided fallback. The
+    /// fallback is kept for the zero-pool case and for explicit requests
+    /// that want to pin a specific voice.
     pub fn ensure(self: *Registry, id: []const u8, default_voice: []const u8) !void {
         _ = std.c.pthread_mutex_lock(&self.mutex);
         defer _ = std.c.pthread_mutex_unlock(&self.mutex);
         if (self.agents.contains(id)) return;
 
         const id_copy = try self.allocator.dupe(u8, id);
-        const voice_copy = try self.allocator.dupe(u8, default_voice);
+        const chosen_voice = if (self.voice_pool.len > 0) blk: {
+            const v = self.voice_pool[self.voice_cursor % self.voice_pool.len];
+            self.voice_cursor +%= 1;
+            break :blk v;
+        } else default_voice;
+        const voice_copy = try self.allocator.dupe(u8, chosen_voice);
         const state: AgentState = .{ .id = id_copy, .default_voice = voice_copy };
         try self.agents.put(self.allocator, id_copy, state);
     }

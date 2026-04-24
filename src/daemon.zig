@@ -106,6 +106,7 @@ pub const Daemon = struct {
             .provider_kind = kind,
             .socket_path = sock_path,
         };
+        daemon.registry.voice_pool = voicePoolFor(kind);
         defer daemon.deinit();
 
         std.debug.print("chorus-daemon: listening on {s} (provider={s})\n", .{
@@ -231,25 +232,29 @@ pub const Daemon = struct {
             else => 1.0,
         } else 1.0;
 
+        const newly_registered = !self.registry.hasAgent(agent_id);
         try self.registry.ensure(agent_id, voice);
+        if (newly_registered) autoLabelPane(self.allocator, agent_id);
 
         const chunks = try chunker.split(self.allocator, text, .{});
         defer chunker.freeChunks(self.allocator, chunks);
 
-        // Hand-raise model. If nobody is currently speaking AND nothing is
-        // already playing through (no priority jobs queued), this message
-        // gets priority = it speaks immediately. Otherwise, every chunk
-        // stays non-priority, i.e. "hand raised", and waits for the user
-        // to call `next` on this agent.
+        // Hand-raise policy. An utterance auto-plays only when it is
+        // clearly a reply to the user's most recent prompt:
         //
-        // Once an agent's first chunk is promoted (either by being the
-        // first speaker or via `next`), the remaining chunks belong to the
-        // same utterance and should flow right behind it without requiring
-        // another hand raise. So: the first chunk inherits the global
-        // decision; subsequent chunks always follow it.
+        //   1. Nobody else is currently speaking, and
+        //   2. the message came from the tmux pane the user is actively
+        //      focused on.
+        //
+        // Any other case (speaking agent already active, OR this request
+        // came from a background pane) goes in as hand-raised and the
+        // user must explicitly call `next` on it. That matches the
+        // mental model of "don't interrupt what I'm reading just because
+        // nobody else happens to be talking".
         const nobody_speaking = self.currentAgentSnapshot() == null and
             !self.queue.anyPriorityJobs();
-        const first_priority = nobody_speaking;
+        const from_focused_pane = isFocusedTmuxPane(self.allocator, agent_id);
+        const first_priority = nobody_speaking and from_focused_pane;
 
         for (chunks, 0..) |chunk, idx| {
             const job: SpeakJob = .{
@@ -458,9 +463,17 @@ pub const Daemon = struct {
     }
 
     /// Play thread. Pops from the ready queue in arrival order and plays
-    /// each chunk to completion. Updates current_agent / stats / registry
-    /// counters based on what's actually audible.
+    /// each chunk to completion through a persistent miniaudio engine.
+    /// Keeping the engine alive between chunks removes device-open and
+    /// init overhead, which was the biggest audible gap between chunks.
     fn playLoop(self: *Daemon) void {
+        var player: audio.Player = undefined;
+        player.init() catch |err| {
+            std.debug.print("chorus-daemon: player init failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        defer player.deinit();
+
         while (self.popReady()) |chunk| {
             defer chunk.deinit(self.allocator);
 
@@ -471,7 +484,7 @@ pub const Daemon = struct {
             if (self.registry.isMuted(chunk.agent_id)) {
                 std.debug.print("chorus-daemon: agent={s} muted, skipping playback\n", .{chunk.agent_id});
             } else {
-                audio.playBytes(chunk.bytes, chunk.volume, &self.current_cancel) catch |err| {
+                player.play(chunk.bytes, chunk.volume, &self.current_cancel) catch |err| {
                     std.debug.print("chorus-daemon: agent={s} play error: {s}\n", .{ chunk.agent_id, @errorName(err) });
                     _ = self.stats.failed.fetchAdd(1, .monotonic);
                     continue;
@@ -625,6 +638,85 @@ fn unlinkIfExists(path: []const u8) void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const z = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return;
     _ = std.c.unlink(z.ptr);
+}
+
+// Distinct voices per provider, picked for maximum audible separation.
+// Used round-robin as agents register.
+const elevenlabs_voice_pool = [_][]const u8{
+    "Rachel", "Adam", "Bella", "Josh", "Antoni", "Elli", "Arnold", "Domi", "Sam", "Fable",
+};
+const openai_voice_pool = [_][]const u8{
+    "alloy", "echo", "fable", "onyx", "nova", "shimmer",
+};
+
+fn voicePoolFor(kind: Daemon.ProviderKind) []const []const u8 {
+    return switch (kind) {
+        .elevenlabs => &elevenlabs_voice_pool,
+        .openai, .azure => &openai_voice_pool,
+    };
+}
+
+/// Set the tmux pane_title to a repo-derived label so users can tell
+/// sessions apart at a glance. Best-effort, silent on any failure.
+fn autoLabelPane(allocator: std.mem.Allocator, agent_id: []const u8) void {
+    if (std.c.getenv("TMUX") == null) return;
+    if (agent_id.len == 0 or agent_id[0] != '%') return;
+
+    // Resolve the pane's working directory via tmux. `pane_current_path`
+    // gives us the cwd of the shell running in that pane.
+    const cwd_cmd = std.fmt.allocPrintSentinel(
+        allocator,
+        "tmux display-message -p -t '{s}' '#{{pane_current_path}}' 2>/dev/null",
+        .{agent_id},
+        0,
+    ) catch return;
+    defer allocator.free(cwd_cmd);
+
+    const f = popen(cwd_cmd.ptr, "r") orelse return;
+    defer _ = pclose(f);
+    var cwd_buf: [std.fs.max_path_bytes]u8 = [_]u8{0} ** std.fs.max_path_bytes;
+    if (fgets(&cwd_buf, cwd_buf.len, f) == null) return;
+    const cwd_raw = std.mem.sliceTo(&cwd_buf, 0);
+    const cwd = std.mem.trim(u8, cwd_raw, " \t\r\n");
+    if (cwd.len == 0) return;
+
+    // Label = last path component (repo name in most cases).
+    const label = std.fs.path.basename(cwd);
+    if (label.len == 0) return;
+
+    const set_cmd = std.fmt.allocPrintSentinel(
+        allocator,
+        "tmux select-pane -t '{s}' -T '{s}' 2>/dev/null",
+        .{ agent_id, label },
+        0,
+    ) catch return;
+    defer allocator.free(set_cmd);
+    const f2 = popen(set_cmd.ptr, "r") orelse return;
+    _ = pclose(f2);
+}
+
+extern "c" fn popen(command: [*:0]const u8, mode: [*:0]const u8) ?*std.c.FILE;
+extern "c" fn pclose(stream: *std.c.FILE) c_int;
+extern "c" fn fgets(buf: [*]u8, size: c_int, stream: *std.c.FILE) ?[*]u8;
+
+/// Best-effort: shell out to tmux and compare the active pane id to the
+/// caller's agent id. Returns true if they match, meaning the agent is
+/// replying to the user's current focus. Returns true as well when tmux
+/// is unavailable (no tmux → we can't tell, so treat every speak as
+/// foreground to preserve plain-shell ergonomics).
+fn isFocusedTmuxPane(allocator: std.mem.Allocator, agent_id: []const u8) bool {
+    _ = allocator;
+    if (std.c.getenv("TMUX") == null) return true;
+
+    const f = popen("tmux display-message -p '#{pane_id}' 2>/dev/null", "r") orelse return true;
+    defer _ = pclose(f);
+
+    var buf: [64]u8 = [_]u8{0} ** 64;
+    if (fgets(&buf, buf.len, f) == null) return true;
+
+    const raw = std.mem.sliceTo(&buf, 0);
+    const focused = std.mem.trim(u8, raw, " \t\r\n");
+    return std.mem.eql(u8, focused, agent_id);
 }
 
 fn detectProvider() Daemon.ProviderKind {
