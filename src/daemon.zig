@@ -37,6 +37,21 @@ const Registry = registry_mod.Registry;
 
 const default_socket_suffix = "chorus.sock";
 
+/// A chunk that has been synthesized and is ready to play. Owned bytes
+/// are freed by whoever pops from the ready queue.
+const ReadyChunk = struct {
+    agent_id: []u8,
+    text: []u8,
+    bytes: []u8,
+    volume: f32,
+
+    fn deinit(self: ReadyChunk, allocator: std.mem.Allocator) void {
+        allocator.free(self.agent_id);
+        allocator.free(self.text);
+        allocator.free(self.bytes);
+    }
+};
+
 pub const Daemon = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -53,6 +68,19 @@ pub const Daemon = struct {
     auto_speak_default: std.atomic.Value(bool) = .init(false),
     wake_worker: std.c.pthread_cond_t = std.c.PTHREAD_COND_INITIALIZER,
     wake_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
+
+    /// Prefetch pipeline. The synth thread pulls jobs from `queue`,
+    /// fetches audio bytes from the provider, and pushes ReadyChunks
+    /// here. The play thread pops from `ready` and plays. Bounded so
+    /// we don't over-synthesize and burn provider credits ahead of
+    /// the listener.
+    ready_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
+    ready_cond_has_item: std.c.pthread_cond_t = std.c.PTHREAD_COND_INITIALIZER,
+    ready_cond_has_room: std.c.pthread_cond_t = std.c.PTHREAD_COND_INITIALIZER,
+    ready: std.ArrayList(ReadyChunk) = .empty,
+    /// Maximum chunks buffered ahead of the player. Three = enough to
+    /// hide ~one TTFB of synth latency without ballooning memory.
+    ready_cap: usize = 3,
 
     current_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
     current_agent: ?[]u8 = null,
@@ -84,8 +112,10 @@ pub const Daemon = struct {
             sock_path, @tagName(kind),
         });
 
-        const worker_thread = try std.Thread.spawn(.{}, workerLoop, .{&daemon});
-        defer worker_thread.join();
+        const synth_thread = try std.Thread.spawn(.{}, synthLoop, .{&daemon});
+        defer synth_thread.join();
+        const play_thread = try std.Thread.spawn(.{}, playLoop, .{&daemon});
+        defer play_thread.join();
 
         try daemon.acceptLoop();
         daemon.queue.close();
@@ -94,6 +124,8 @@ pub const Daemon = struct {
     fn deinit(self: *Daemon) void {
         self.queue.deinit();
         self.registry.deinit();
+        for (self.ready.items) |c| c.deinit(self.allocator);
+        self.ready.deinit(self.allocator);
         if (self.current_agent) |a| self.allocator.free(a);
         self.allocator.free(self.socket_path);
     }
@@ -389,30 +421,89 @@ pub const Daemon = struct {
         try writer.flush();
     }
 
-    fn workerLoop(self: *Daemon) void {
+    /// Synth thread. Pulls the next eligible job, synthesizes it via the
+    /// provider, and pushes the decoded bytes to the ready queue for the
+    /// play thread to consume. Blocks when the ready queue is full so we
+    /// don't over-prefetch.
+    fn synthLoop(self: *Daemon) void {
         while (true) {
             const job_opt = self.claimNextJob() orelse {
-                // Nothing eligible right now. Wait for a signal (new job,
-                // resume, or next promotion).
                 self.waitForWake(100);
                 continue;
             };
             var job = job_opt;
             defer job.deinit(self.allocator);
 
-            self.setCurrent(job.agent_id);
-            defer self.clearCurrent();
-            self.current_cancel.reset();
-
-            self.processJob(job) catch |err| {
-                std.debug.print("chorus-daemon: agent={s} error: {s}\n", .{ job.agent_id, @errorName(err) });
+            const bytes = self.synthesizeJob(job) catch |err| {
+                std.debug.print("chorus-daemon: agent={s} synth error: {s}\n", .{ job.agent_id, @errorName(err) });
                 _ = self.stats.failed.fetchAdd(1, .monotonic);
                 continue;
             };
+            const volume = self.registry.volume(job.agent_id);
 
-            self.registry.recordProcessed(job.agent_id, job.text);
+            const chunk: ReadyChunk = .{
+                .agent_id = self.allocator.dupe(u8, job.agent_id) catch {
+                    self.allocator.free(bytes);
+                    continue;
+                },
+                .text = self.allocator.dupe(u8, job.text) catch {
+                    self.allocator.free(bytes);
+                    continue;
+                },
+                .bytes = bytes,
+                .volume = volume,
+            };
+            self.pushReady(chunk);
+        }
+    }
+
+    /// Play thread. Pops from the ready queue in arrival order and plays
+    /// each chunk to completion. Updates current_agent / stats / registry
+    /// counters based on what's actually audible.
+    fn playLoop(self: *Daemon) void {
+        while (self.popReady()) |chunk| {
+            defer chunk.deinit(self.allocator);
+
+            self.setCurrent(chunk.agent_id);
+            defer self.clearCurrent();
+            self.current_cancel.reset();
+
+            if (self.registry.isMuted(chunk.agent_id)) {
+                std.debug.print("chorus-daemon: agent={s} muted, skipping playback\n", .{chunk.agent_id});
+            } else {
+                audio.playBytes(chunk.bytes, chunk.volume, &self.current_cancel) catch |err| {
+                    std.debug.print("chorus-daemon: agent={s} play error: {s}\n", .{ chunk.agent_id, @errorName(err) });
+                    _ = self.stats.failed.fetchAdd(1, .monotonic);
+                    continue;
+                };
+            }
+            self.registry.recordProcessed(chunk.agent_id, chunk.text);
             _ = self.stats.processed.fetchAdd(1, .monotonic);
         }
+    }
+
+    fn pushReady(self: *Daemon, chunk: ReadyChunk) void {
+        _ = std.c.pthread_mutex_lock(&self.ready_mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.ready_mutex);
+        while (self.ready.items.len >= self.ready_cap) {
+            _ = std.c.pthread_cond_wait(&self.ready_cond_has_room, &self.ready_mutex);
+        }
+        self.ready.append(self.allocator, chunk) catch {
+            chunk.deinit(self.allocator);
+            return;
+        };
+        _ = std.c.pthread_cond_signal(&self.ready_cond_has_item);
+    }
+
+    fn popReady(self: *Daemon) ?ReadyChunk {
+        _ = std.c.pthread_mutex_lock(&self.ready_mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.ready_mutex);
+        while (self.ready.items.len == 0) {
+            _ = std.c.pthread_cond_wait(&self.ready_cond_has_item, &self.ready_mutex);
+        }
+        const c = self.ready.orderedRemove(0);
+        _ = std.c.pthread_cond_signal(&self.ready_cond_has_room);
+        return c;
     }
 
     /// Pop the next job the worker is allowed to play.
@@ -472,43 +563,36 @@ pub const Daemon = struct {
         self.current_agent = null;
     }
 
-    fn processJob(self: *Daemon, job: SpeakJob) !void {
-        std.debug.print("chorus-daemon: agent={s} speaking ({d} chars)\n", .{ job.agent_id, job.text.len });
-
-        if (self.registry.isMuted(job.agent_id)) {
-            std.debug.print("chorus-daemon: agent={s} muted, skipping playback\n", .{job.agent_id});
-            return;
-        }
-
-        const volume = self.registry.volume(job.agent_id);
-
+    /// Fetch audio bytes for a single job through the configured provider.
+    /// Caller owns the returned slice.
+    fn synthesizeJob(self: *Daemon, job: SpeakJob) ![]u8 {
+        std.debug.print("chorus-daemon: agent={s} synth ({d} chars)\n", .{ job.agent_id, job.text.len });
         switch (self.provider_kind) {
             .openai => {
                 var oa = try OpenAI.initFromEnv(self.allocator);
                 defer oa.deinit();
-                try self.synthAndPlay(oa.provider_handle(), job, volume);
+                return try self.synthOnce(oa.provider_handle(), job);
             },
             .azure => {
                 var az = try Azure.initFromEnv(self.allocator);
                 defer az.deinit();
-                try self.synthAndPlay(az.provider_handle(), job, volume);
+                return try self.synthOnce(az.provider_handle(), job);
             },
             .elevenlabs => {
                 var el = try ElevenLabs.initFromEnv(self.allocator);
                 defer el.deinit();
-                try self.synthAndPlay(el.provider_handle(), job, volume);
+                return try self.synthOnce(el.provider_handle(), job);
             },
         }
     }
 
-    fn synthAndPlay(self: *Daemon, p: provider.Provider, job: SpeakJob, volume: f32) !void {
-        var result = try p.synthesize(self.allocator, self.io, .{
+    fn synthOnce(self: *Daemon, p: provider.Provider, job: SpeakJob) ![]u8 {
+        const result = try p.synthesize(self.allocator, self.io, .{
             .text = job.text,
             .voice_id = job.voice,
             .speed = job.speed,
         });
-        defer result.deinit(self.allocator);
-        try audio.playBytes(result.bytes, volume, &self.current_cancel);
+        return result.bytes;
     }
 };
 

@@ -16,7 +16,11 @@ const std = @import("std");
 const provider = @import("../provider.zig");
 
 const api_base = "https://api.elevenlabs.io";
-const default_model = "eleven_turbo_v2_5";
+// Flash v2.5 is ElevenLabs' lowest-latency model (~75ms TTFB at time of
+// writing), at the cost of a small quality drop vs Turbo. Chorus
+// prioritizes responsiveness since audio is the user's primary channel
+// for Claude Code feedback.
+const default_model = "eleven_flash_v2_5";
 
 // A small set of popular preset voices so `chorus list` / tools/list have
 // something useful without hitting the network. Users can pass arbitrary
