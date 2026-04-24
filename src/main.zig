@@ -271,12 +271,8 @@ fn tmuxPane(allocator: std.mem.Allocator, io: std.Io, args: []const [:0]const u8
             .integer => |i| @intCast(i),
             else => 0,
         };
-        const auto_v = ind.object.get("auto_speak");
-        const is_auto = auto_v != null and auto_v.? == .bool and auto_v.?.bool;
-        const glyph = if (is_auto) "🔊" else "🙋";
-
         var buf: [256]u8 = undefined;
-        const s = try std.fmt.bufPrint(&buf, "{s}{d}", .{ glyph, count });
+        const s = try std.fmt.bufPrint(&buf, "🙋{d}", .{count});
         _ = std.c.write(1, s.ptr, s.len);
         return;
     }
@@ -306,12 +302,8 @@ fn renderIndicators(reply: []const u8, allocator: std.mem.Allocator) !void {
         const waiting_v = ind.object.get("waiting") orelse continue;
         if (id_v != .string or waiting_v != .integer) continue;
 
-        const auto_v = ind.object.get("auto_speak");
-        const is_auto = auto_v != null and auto_v.? == .bool and auto_v.?.bool;
-        const glyph = if (is_auto) "🔊" else "🙋";
-
         if (i > 0) try fbs.writeAll(" ");
-        try fbs.print("[{s}{s}:{d}]", .{ glyph, id_v.string, waiting_v.integer });
+        try fbs.print("[🙋{s}:{d}]", .{ id_v.string, waiting_v.integer });
     }
     const out = fbs.buffered();
     _ = std.c.write(1, out.ptr, out.len);

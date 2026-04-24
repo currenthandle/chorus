@@ -46,11 +46,11 @@ pub const Daemon = struct {
     provider_kind: ProviderKind,
     socket_path: []u8,
 
-    /// Daemon-wide default for auto-speak. When false, queued jobs sit in
-    /// the queue until a client calls `next`. Per-agent overrides in the
-    /// registry take precedence. Defaults to true so existing behavior
-    /// (immediate speech) is preserved.
-    auto_speak_default: std.atomic.Value(bool) = .init(true),
+    /// Global override. When true, every queued job is treated as
+    /// priority = the old "speak in FIFO order" behavior. When false
+    /// (default), the hand-raise model applies: only the first arrival
+    /// while idle speaks automatically; everyone else waits for `next`.
+    auto_speak_default: std.atomic.Value(bool) = .init(false),
     wake_worker: std.c.pthread_cond_t = std.c.PTHREAD_COND_INITIALIZER,
     wake_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
 
@@ -204,18 +204,47 @@ pub const Daemon = struct {
         const chunks = try chunker.split(self.allocator, text, .{});
         defer chunker.freeChunks(self.allocator, chunks);
 
-        for (chunks) |chunk| {
+        // Hand-raise model. If nobody is currently speaking AND nothing is
+        // already playing through (no priority jobs queued), this message
+        // gets priority = it speaks immediately. Otherwise, every chunk
+        // stays non-priority, i.e. "hand raised", and waits for the user
+        // to call `next` on this agent.
+        //
+        // Once an agent's first chunk is promoted (either by being the
+        // first speaker or via `next`), the remaining chunks belong to the
+        // same utterance and should flow right behind it without requiring
+        // another hand raise. So: the first chunk inherits the global
+        // decision; subsequent chunks always follow it.
+        const nobody_speaking = self.currentAgentSnapshot() == null and
+            !self.queue.anyPriorityJobs();
+        const first_priority = nobody_speaking;
+
+        for (chunks, 0..) |chunk, idx| {
             const job: SpeakJob = .{
                 .agent_id = try self.allocator.dupe(u8, agent_id),
                 .text = try self.allocator.dupe(u8, chunk),
                 .voice = try self.allocator.dupe(u8, voice),
                 .speed = speed,
+                // Non-first chunks piggy-back on the first: same priority.
+                // This keeps a long utterance from stalling mid-sentence
+                // behind itself.
+                .priority = if (idx == 0) first_priority else first_priority,
             };
             try self.queue.push(job);
         }
 
         self.wakeWorker();
-        try okWith(writer, .{ .queued = self.queue.len(), .chunks = chunks.len });
+        try okWith(writer, .{
+            .queued = self.queue.len(),
+            .chunks = chunks.len,
+            .hand_raised = !first_priority,
+        });
+    }
+
+    fn currentAgentSnapshot(self: *Daemon) ?[]const u8 {
+        _ = std.c.pthread_mutex_lock(&self.current_mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.current_mutex);
+        return self.current_agent;
     }
 
     fn opStatus(self: *Daemon, writer: *std.Io.Writer) !void {
@@ -291,62 +320,49 @@ pub const Daemon = struct {
     }
 
     fn opIndicators(self: *Daemon, writer: *std.Io.Writer) !void {
-        var counts = try self.queue.countByAgent(self.allocator);
+        var counts = try self.queue.countHandRaisedByAgent(self.allocator);
         defer counts.deinit(self.allocator);
 
-        // Serialize as an array of {agent_id, waiting} objects so tmux
-        // scripts can iterate without JSON-path gymnastics.
+        // Only hand-raised agents count as indicators. Priority jobs are
+        // about to play or already playing; they don't need a "waiting"
+        // badge.
         try writer.writeAll("{\"ok\":true,\"indicators\":[");
         var it = counts.iterator();
         var first = true;
         while (it.next()) |entry| {
             if (!first) try writer.writeAll(",");
             first = false;
-            const effective = self.registry.effectiveAutoSpeak(
-                entry.key_ptr.*,
-                self.auto_speak_default.load(.acquire),
-            );
             try std.json.Stringify.value(.{
                 .agent_id = entry.key_ptr.*,
                 .waiting = entry.value_ptr.*,
-                .auto_speak = effective,
             }, .{}, writer);
         }
         try writer.writeAll("]}\n");
     }
 
     fn opNext(self: *Daemon, root: std.json.Value, writer: *std.Io.Writer) !void {
-        const agent_opt = if (root.object.get("agent_id")) |v| switch (v) {
+        const agent_opt: ?[]const u8 = if (root.object.get("agent_id")) |v| switch (v) {
             .string => |s| s,
             else => return error.BadField,
         } else null;
 
-        // Mark the chosen agent (or all) as auto-speak for exactly one job
-        // by popping directly and handing to the worker. Simpler path: pop
-        // the first matching job and push it into a priority slot.
-        if (agent_opt) |agent| {
-            const job = self.queue.popAgent(agent) orelse {
-                try okWith(writer, .{ .promoted = false });
-                return;
-            };
-            try self.queue.pushFront(job);
-        } else {
-            // No specific agent: pop the head that is currently waiting
-            // behind auto-speak=false. Nothing to do if head is already
-            // eligible.
-            const head = self.queue.peekHeadAgent(self.allocator) orelse {
-                try okWith(writer, .{ .promoted = false });
-                return;
-            };
-            defer self.allocator.free(head);
-            const job = self.queue.popAgent(head) orelse {
-                try okWith(writer, .{ .promoted = false });
-                return;
-            };
-            try self.queue.pushFront(job);
+        // Figure out which agent to promote. With an explicit agent, use
+        // that. Without, pick the first hand-raised job in the queue.
+        const target: []u8 = blk: {
+            if (agent_opt) |a| break :blk try self.allocator.dupe(u8, a);
+            if (self.queue.firstNonPriorityAgent(self.allocator)) |a| break :blk a;
+            try okWith(writer, .{ .promoted = 0 });
+            return;
+        };
+        defer self.allocator.free(target);
+
+        const promoted = self.queue.promoteAgent(target);
+        if (promoted == 0) {
+            try okWith(writer, .{ .promoted = 0 });
+            return;
         }
         self.wakeWorker();
-        try okWith(writer, .{ .promoted = true });
+        try okWith(writer, .{ .promoted = promoted });
     }
 
     fn wakeWorker(self: *Daemon) void {
@@ -399,24 +415,25 @@ pub const Daemon = struct {
         }
     }
 
-    /// Pop the next job the worker is allowed to play. Skips jobs for
-    /// paused or hand-raise agents without removing them. Returns null if
-    /// nothing is currently eligible.
+    /// Pop the next job the worker is allowed to play.
+    ///
+    /// Hand-raise model: the worker only drains jobs with `priority = true`.
+    /// Non-priority jobs sit silently in the queue until a client calls
+    /// `next` on their agent, which flips them to priority.
+    ///
+    /// The global `auto_speak_default` escape hatch, when true, treats
+    /// every queued job as priority — restoring the old "just speak in
+    /// FIFO order" behavior for users who want it.
     fn claimNextJob(self: *Daemon) ?SpeakJob {
-        const default_auto = self.auto_speak_default.load(.acquire);
+        const force_auto = self.auto_speak_default.load(.acquire);
 
-        // Linear scan under a single lock so we can honor FIFO among
-        // eligible agents while leaving ineligible jobs in place.
         _ = std.c.pthread_mutex_lock(&self.queue.mutex);
         defer _ = std.c.pthread_mutex_unlock(&self.queue.mutex);
         var i: usize = 0;
         while (i < self.queue.jobs.items.len) : (i += 1) {
             const job = self.queue.jobs.items[i];
             if (self.registry.isPaused(job.agent_id)) continue;
-            // Priority jobs (promoted via `next`) skip the auto-speak gate.
-            if (!job.priority and
-                !self.registry.effectiveAutoSpeak(job.agent_id, default_auto))
-                continue;
+            if (!job.priority and !force_auto) continue;
             return self.queue.jobs.orderedRemove(i);
         }
         return null;

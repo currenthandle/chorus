@@ -118,6 +118,49 @@ pub const JobQueue = struct {
         return null;
     }
 
+    /// True if any queued job has priority = true. Used by the daemon to
+    /// decide whether a brand-new utterance should auto-promote (nobody
+    /// currently speaking) or hand-raise.
+    pub fn anyPriorityJobs(self: *JobQueue) bool {
+        _ = std.c.pthread_mutex_lock(&self.mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.mutex);
+        for (self.jobs.items) |j| {
+            if (j.priority) return true;
+        }
+        return false;
+    }
+
+    /// Flip every hand-raised job for `agent_id` to priority so the worker
+    /// will drain them. Returns the number of jobs promoted.
+    pub fn promoteAgent(self: *JobQueue, agent_id: []const u8) usize {
+        _ = std.c.pthread_mutex_lock(&self.mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.mutex);
+        var n: usize = 0;
+        for (self.jobs.items) |*job| {
+            if (std.mem.eql(u8, job.agent_id, agent_id) and !job.priority) {
+                job.priority = true;
+                n += 1;
+            }
+        }
+        if (n > 0) _ = std.c.pthread_cond_signal(&self.cond);
+        return n;
+    }
+
+    /// Agent id of the oldest hand-raised (non-priority) job, or null if
+    /// every queued job is already priority. Caller owns the returned
+    /// slice.
+    pub fn firstNonPriorityAgent(
+        self: *JobQueue,
+        allocator: std.mem.Allocator,
+    ) ?[]u8 {
+        _ = std.c.pthread_mutex_lock(&self.mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.mutex);
+        for (self.jobs.items) |job| {
+            if (!job.priority) return allocator.dupe(u8, job.agent_id) catch null;
+        }
+        return null;
+    }
+
     /// Count queued jobs per agent. Returns a map of agent_id → count.
     /// Caller owns the map and should call `deinit` on it.
     pub fn countByAgent(
@@ -129,6 +172,26 @@ pub const JobQueue = struct {
         var out: std.StringHashMapUnmanaged(usize) = .empty;
         errdefer out.deinit(allocator);
         for (self.jobs.items) |job| {
+            const gop = try out.getOrPut(allocator, job.agent_id);
+            if (!gop.found_existing) gop.value_ptr.* = 0;
+            gop.value_ptr.* += 1;
+        }
+        return out;
+    }
+
+    /// Like `countByAgent` but only counts hand-raised (non-priority)
+    /// jobs. Used by `indicators` so the tmux badge only flashes on
+    /// agents actually waiting for the user to call on them.
+    pub fn countHandRaisedByAgent(
+        self: *JobQueue,
+        allocator: std.mem.Allocator,
+    ) !std.StringHashMapUnmanaged(usize) {
+        _ = std.c.pthread_mutex_lock(&self.mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.mutex);
+        var out: std.StringHashMapUnmanaged(usize) = .empty;
+        errdefer out.deinit(allocator);
+        for (self.jobs.items) |job| {
+            if (job.priority) continue;
             const gop = try out.getOrPut(allocator, job.agent_id);
             if (!gop.found_existing) gop.value_ptr.* = 0;
             gop.value_ptr.* += 1;
