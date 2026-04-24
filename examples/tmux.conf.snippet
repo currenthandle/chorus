@@ -15,8 +15,11 @@ set -g status-interval 1
 
 set -g status-right '#(chorus tmux-status) | %H:%M'
 
-# Per-pane hand-raise badge. Tmux evaluates #{pane_title} and we let chorus
-# emit the badge (or nothing when that pane has no waiting audio).
+# Per-pane label + hand-raise badge. Tmux's pane_title is settable per
+# pane via `tmux select-pane -T "@investigator"`; chorus tacks on the
+# badge when that pane has audio waiting.
+set -g pane-border-status top
+set -g pane-border-format " #{pane_title} #(chorus tmux-pane #{pane_id}) "
 set -g pane-border-status top
 set -g pane-border-format " #{pane_index} #(chorus tmux-pane #{pane_id}) "
 

@@ -173,6 +173,13 @@ pub const Daemon = struct {
         return error.UnknownOp;
     }
 
+    fn fallbackVoice(self: *Daemon) []const u8 {
+        return switch (self.provider_kind) {
+            .openai, .azure => "alloy",
+            .elevenlabs => "Rachel",
+        };
+    }
+
     // Expose internals for the worker's locked scan in claimNextJob.
     // (Re-entry through Registry's own mutex is fine; the two locks are
     // independent and we always take queue first, registry second.)
@@ -180,11 +187,12 @@ pub const Daemon = struct {
     fn opSpeak(self: *Daemon, root: std.json.Value, writer: *std.Io.Writer) !void {
         const agent_id = try requireString(root, "agent_id");
         const text = try requireString(root, "text");
-        // Voice is optional; fall back to the agent's configured default.
+        // Voice is optional; fall back to the agent's configured default,
+        // then to a provider-appropriate built-in.
         const voice: []const u8 = if (root.object.get("voice")) |v| switch (v) {
             .string => |s| s,
             else => return error.BadField,
-        } else self.registry.defaultVoice(agent_id) orelse "alloy";
+        } else self.registry.defaultVoice(agent_id) orelse self.fallbackVoice();
         const speed: f32 = if (root.object.get("speed")) |s| switch (s) {
             .float => |f| @floatCast(f),
             .integer => |i| @floatFromInt(i),

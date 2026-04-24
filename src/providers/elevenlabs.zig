@@ -154,11 +154,25 @@ pub const ElevenLabs = struct {
     }
 };
 
-/// Map a friendly display name (case-insensitive) to a preset voice id so
-/// users can type `chorus voice %12 rachel` instead of a 20-char hex.
+/// Map a friendly name (case-insensitive) to a preset ElevenLabs voice id.
+/// Also maps OpenAI voice names to rough ElevenLabs equivalents so legacy
+/// callers that still pass "alloy" / "onyx" / etc. don't 404.
 fn resolveAlias(input: []const u8) ?[]const u8 {
+    // Preset display names (Rachel, Adam, …).
     for (voices_list) |v| {
         if (std.ascii.eqlIgnoreCase(input, v.display_name)) return v.id;
+    }
+    // OpenAI → ElevenLabs rough mapping.
+    const openai_map = [_]struct { name: []const u8, id: []const u8 }{
+        .{ .name = "alloy", .id = "21m00Tcm4TlvDq8ikWAM" }, // Rachel
+        .{ .name = "echo", .id = "ErXwobaYiN019PkySvjV" }, // Antoni
+        .{ .name = "fable", .id = "TxGEqnHWrfWFTfGW9XjX" }, // Josh
+        .{ .name = "onyx", .id = "pNInz6obpgDQGcFmaJgB" }, // Adam
+        .{ .name = "nova", .id = "EXAVITQu4vr4xnSDxMaL" }, // Bella
+        .{ .name = "shimmer", .id = "MF3mGyEYCl7XYWbV9V6O" }, // Elli
+    };
+    for (openai_map) |m| {
+        if (std.ascii.eqlIgnoreCase(input, m.name)) return m.id;
     }
     return null;
 }
